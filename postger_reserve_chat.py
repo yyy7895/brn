@@ -1,0 +1,425 @@
+# -*- coding: utf-8 -*-
+"""
+本地聊天机器人后端 + RAG 知识库。
+- 聊天：Ollama 流式生成，历史存 PostgreSQL
+- RAG：上传文档 -> 切块 -> 向量化 -> pgvector 检索 -> 注入 prompt
+"""
+# ============================================
+# 模块1：导入依赖
+# ============================================
+import os
+import asyncio
+import json
+import shutil
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+
+import httpx
+import requests
+from fastapi import FastAPI, Query, UploadFile, File, HTTPException
+from sqlalchemy import text
+from sse_starlette.sse import EventSourceResponse
+
+# 复用项目统一日志（loguru），缺失时回退标准 logging
+try:
+    from src.utils.logger import log
+except Exception:  # pragma: no cover
+    import logging
+    log = logging.getLogger("chat")
+
+# RAG 相关模块
+from src.config import cfg
+from src.db.connection import engine, safe_dsn
+from src.db.init_db import init_db
+from src.rag.embedding import embed
+from src.rag.retriever import pgv_search
+from src.rag import ingest as rag_ingest
+
+# ============================================
+# 模块2：基础配置（统一从 cfg 读取，保留旧变量名做别名，老代码无感）
+# ============================================
+app = FastAPI(title="本地聊天机器人后端 + RAG")
+
+# 别名：让下方原有逻辑（用 OLLAMA_URL / MODEL_NAME / DB_URL / engine 名字）继续可用
+OLLAMA_URL = cfg.OLLAMA_CHAT_URL      # Ollama 聊天接口
+MODEL_NAME = cfg.CHAT_MODEL
+DB_URL = cfg.DB_URL
+# engine 复用 src/db/connection.py 的全局共享连接池
+executor = ThreadPoolExecutor()
+
+
+@app.on_event("startup")
+def _on_startup():
+    """启动时建 RAG 表（幂等）。PG 临时不可用时也不阻断启动。"""
+    try:
+        init_db()
+    except Exception as e:
+        log.error(f"【启动建表失败，RAG 相关接口可能不可用】{repr(e)}")
+
+
+def _retrieve_context(query: str) -> list:
+    """
+    RAG 检索：把用户问题向量化 -> pgvector 取 top-k 块。
+    任何异常都返回空列表（降级为纯对话，不阻断聊天）。
+    """
+    try:
+        q_emb = embed(query)
+        if not q_emb:
+            return []
+        return pgv_search(q_emb)
+    except Exception as e:
+        log.warning(f"【RAG 检索失败，降级为纯对话】{repr(e)}")
+        return []
+
+
+# ============================================
+# 模块3：数据库函数（chat_history）
+# ============================================
+
+def save_record(user_id: str, user_msg: str, bot_msg: str):
+    """保存单轮问答"""
+    sql = text(
+        "INSERT INTO chat_history(user_id, user_content, bot_content) "
+        "VALUES(:uid, :u, :b)"
+    )
+    with engine.connect() as conn:
+        conn.execute(sql, {"uid": user_id, "u": user_msg, "b": bot_msg})
+        conn.commit()
+
+
+def get_history_messages(user_id: str):
+    """
+    读取用户全部历史对话 -> 拼 LLM messages 格式
+    [{role, content}, ...] —— 用于塞进 Ollama 的 messages
+    """
+    sql = text(
+        "SELECT user_content, bot_content "
+        "FROM chat_history "
+        "WHERE user_id=:uid "
+        "ORDER BY creat_time ASC"
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"uid": user_id}).fetchall()
+    msg_list = []
+    for u_txt, b_txt in rows:
+        msg_list.append({"role": "user", "content": u_txt})
+        msg_list.append({"role": "assistant", "content": b_txt})
+    return msg_list
+
+
+# 旧函数名保留（兼容），重写个别名
+get_history = get_history_messages
+
+
+def list_history_records(user_id: str, page: int = 1, page_size: int = 50):
+    """
+    分页读取 chat_history 原始记录，用于前端 /history 接口
+    返回: (records, total_count)
+      records: [{user_content, bot_content, creat_time?}, ...]
+    """
+    sql_count = text("SELECT COUNT(*) FROM chat_history WHERE user_id=:uid")
+    with engine.connect() as conn:
+        total = conn.execute(sql_count, {"uid": user_id}).scalar() or 0
+
+    offset = max(0, (page - 1) * page_size)
+    sql = text(
+        "SELECT user_content, bot_content, creat_time "
+        "FROM chat_history "
+        "WHERE user_id=:uid "
+        "ORDER BY creat_time ASC "
+        "LIMIT :lim OFFSET :off"
+    )
+    with engine.connect() as conn:
+        rows = conn.execute(
+            sql,
+            {"uid": user_id, "lim": int(page_size), "off": int(offset)},
+        ).mappings().all()
+
+    records = [dict(r) for r in rows]
+    return records, total
+
+
+# ============================================
+# 模块4：流式聊天接口（保留原逻辑，插入 RAG 检索）
+# ============================================
+@app.post("/chat/stream")
+async def chat_stream(user_id: str, current_msg: str):
+    try:
+        loop = asyncio.get_running_loop()
+        history = await loop.run_in_executor(executor, get_history_messages, user_id)
+        # 限制发给 LLM 的历史长度：DB 存全量，发给 deepseek-r1 只取最近 N 条。
+        # 否则历史越长 prompt_eval 越慢，思考模型首 token 动辄 1~2 分钟甚至超时。
+        LLM_HISTORY_LIMIT = 10
+        if len(history) > LLM_HISTORY_LIMIT:
+            history = history[-LLM_HISTORY_LIMIT:]
+        history.append({"role": "user", "content": current_msg})
+
+        # ---- RAG：向量化用户问题 + pgvector 检索 top-k 块，拼成 system prompt ----
+        # 增加变量存储检索结果，用于最终的引用溯源
+        rag_sources = []
+        retrieved = await loop.run_in_executor(executor, _retrieve_context, current_msg)
+        if retrieved:
+            context = "\n---\n".join(r["content"] for r in retrieved)
+            system_prompt = (
+                "你是一个知识库问答助手。请优先依据下面提供的资料回答用户问题；"
+                "若资料中没有答案，请如实说明，不要编造。\n\n【参考资料】\n" + context
+            )
+            history.insert(0, {"role": "system", "content": system_prompt})
+            # 把检索到的文档信息（id, title, content）存下来，返回给前端做引用
+            for r in retrieved:
+                rag_sources.append({
+                    "doc_id": r["doc_id"],
+                    "doc_title": r.get("doc_title", "未知文档"),
+                    "chunk_content": r["content"][:100] + "..." if len(r["content"]) > 100 else r["content"]
+                })
+
+        ollama_payload = {
+            "model": MODEL_NAME,
+            "messages": history,
+            "stream": True,
+        }
+
+        async def generate():
+            full_response = ""   # 只累计正式回答（content），存库用
+            full_thinking = ""   # 累计思考内容（thinking），不存库、仅前端展示
+            # 思考模型（deepseek-r1）思考阶段可能持续 1~2 分钟，超时放宽到 300s
+            async with httpx.AsyncClient(timeout=300.0) as client:
+                async with client.stream("POST", OLLAMA_URL, json=ollama_payload) as response:
+                    async for line in response.aiter_lines():
+                        if not line.strip():
+                            continue
+                        try:
+                            chunk_data = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+
+                        if "message" not in chunk_data:
+                            continue
+                        msg = chunk_data["message"]
+                        token = msg.get("content", "")
+                        # deepseek-r1 等思考模型：思考阶段 content 为空，真正文字在 thinking 字段
+                        thinking = msg.get("thinking", "")
+                        full_response += token
+                        full_thinking += thinking
+
+                        # 只在有实质内容（token 或 thinking）时下发，
+                        # 否则思考阶段会刷一堆空 token 事件、徒增前端解析压力
+                        if token or thinking:
+                            yield {
+                                "event": "message",
+                                "data": json.dumps({
+                                    "token": token,
+                                    "thinking": thinking,
+                                    "done": chunk_data.get("done", False),
+                                }),
+                            }
+
+                        if chunk_data.get("done", False):
+                            await loop.run_in_executor(
+                                executor,
+                                save_record,
+                                user_id, current_msg, full_response,
+                            )
+                            # 把检索到的 sources 返回给前端，用于引用溯源展示
+                            yield {
+                                "event": "done",
+                                "data": json.dumps({
+                                    "full_response": full_response,
+                                    "sources": rag_sources,  # 新增字段
+                                }),
+                            }
+
+        return EventSourceResponse(generate())
+
+    except Exception as e:
+        log.error(f"【流式接口异常】{repr(e)}")
+
+        async def error_generate():
+            yield {
+                "event": "error",
+                "data": json.dumps({"error": str(e)}),
+            }
+        return EventSourceResponse(error_generate())
+
+
+# ============================================
+# 模块5：历史记录查询接口
+# ============================================
+@app.get("/history")
+def list_history(
+    user_id: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+):
+    try:
+        records, total = list_history_records(user_id, page, page_size)
+        return {
+            "code": 200,
+            "msg": "ok",
+            "data": records,
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
+    except Exception as e:
+        log.error(f"【/history 异常】{repr(e)}")
+        return {
+            "code": 500,
+            "msg": "服务内部异常",
+            "detail": str(e),
+            "data": [],
+        }
+
+
+# ============================================
+# 模块6：历史记录删除接口
+# ============================================
+@app.get("/history/delete")
+def delete_history(user_id: str):
+    try:
+        sql = text("DELETE FROM chat_history WHERE user_id=:uid")
+        with engine.connect() as conn:
+            conn.execute(sql, {"uid": user_id})
+            conn.commit()
+        log.info(f"已删除用户 {user_id} 的历史记录")
+        return {"code": 200, "msg": "历史记录已删除"}
+    except Exception as e:
+        log.error(f"【删除历史异常】{repr(e)}")
+        return {"code": 500, "msg": "服务内部异常", "detail": str(e)}
+
+
+# ============================================
+# 模块7：非流式聊天接口
+# ============================================
+@app.post("/chat")
+def chat(user_id: str, current_msg: str):
+    try:
+        history = get_history_messages(user_id)
+        history.append({"role": "user", "content": current_msg})
+        res = requests.post(
+            OLLAMA_URL,
+            json={"model": MODEL_NAME, "messages": history, "stream": False},
+            timeout=120,
+        )
+        res.raise_for_status()
+        bot_ans = res.json()["message"]["content"]
+        save_record(user_id, current_msg, bot_ans)
+        return {
+            "user_id": user_id,
+            "question": current_msg,
+            "answer": bot_ans,
+            "history": history,
+        }
+    except Exception as e:
+        log.error(f"【/chat 异常】{repr(e)}")
+        return {"code": 500, "msg": "服务内部异常", "detail": str(e)}
+
+
+# ============================================
+# 模块8：知识库管理接口 /kb/*
+# ============================================
+@app.post("/kb/upload")
+async def kb_upload(file: UploadFile = File(...)):
+    """
+    上传文档：存到 UPLOAD_DIR，落 documents 表（chunk_count=0）。
+    返回 doc_id，前端再调 /kb/ingest/{doc_id} 触发向量化。
+    UploadFile：FastAPI 的异步上传文件句柄（依赖 python-multipart）。
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名为空")
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in (".txt", ".md", ".pdf"):
+        raise HTTPException(status_code=400, detail="仅支持 .txt / .md / .pdf")
+
+    # 用时间戳前缀避免同名文件覆盖
+    saved_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{file.filename}"
+    saved_path = cfg.UPLOAD_DIR / saved_name
+    with open(saved_path, "wb") as f:
+        shutil.copyfileobj(file.file, f)
+
+    doc_id = rag_ingest.create_document(
+        title=os.path.splitext(file.filename)[0],
+        source=saved_name,
+        file_type=ext.lstrip("."),
+    )
+    return {
+        "code": 200,
+        "msg": "上传成功，尚未向量化",
+        "data": {"doc_id": doc_id, "source": saved_name, "file_type": ext.lstrip(".")},
+    }
+
+
+@app.post("/kb/ingest/{doc_id}")
+def kb_ingest(doc_id: int):
+    """对已上传文档执行 切块 + 向量化 + 入库。"""
+    doc = rag_ingest.get_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    if doc["chunk_count"] and doc["chunk_count"] > 0:
+        # 已入库则先清掉旧块再重建（便于重复向量化）
+        with engine.connect() as conn:
+            conn.execute(
+                text("DELETE FROM document_chunks WHERE doc_id=:did"), {"did": doc_id}
+            )
+            conn.commit()
+
+    path = cfg.UPLOAD_DIR / doc["source"]
+    if not path.exists():
+        raise HTTPException(status_code=404, detail=f"原始文件不存在: {doc['source']}")
+    text_content, _ = rag_ingest.read_file(str(path))
+    n = rag_ingest.ingest_document(doc_id, text_content)
+    return {"code": 200, "msg": "向量化完成", "data": {"doc_id": doc_id, "chunk_count": n}}
+
+
+@app.get("/kb/documents")
+def kb_list_documents():
+    """文档列表。"""
+    docs = rag_ingest.list_documents()
+    # created_at 转 ISO 字符串，便于前端展示
+    for d in docs:
+        if d.get("created_at") is not None:
+            d["created_at"] = d["created_at"].isoformat()
+    return {"code": 200, "msg": "ok", "data": docs}
+
+
+@app.delete("/kb/documents/{doc_id}")
+def kb_delete_document(doc_id: int):
+    """删除文档（级联删块）；同时尝试删原文件。"""
+    doc = rag_ingest.get_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    rag_ingest.delete_document(doc_id)
+    # 删原文件（失败不影响）
+    try:
+        path = cfg.UPLOAD_DIR / doc["source"]
+        if path.exists():
+            path.unlink()
+    except Exception as e:
+        log.warning(f"删原文件失败: {repr(e)}")
+    return {"code": 200, "msg": "已删除", "data": {"doc_id": doc_id}}
+
+
+@app.get("/")
+def root():
+    return {
+        "msg": "本地聊天机器人后端服务已启动（含 RAG）",
+        "interfaces": [
+            "POST /chat",
+            "POST /chat/stream",
+            "GET  /history",
+            "GET  /history/delete",
+            "POST /kb/upload",
+            "POST /kb/ingest/{doc_id}",
+            "GET  /kb/documents",
+            "DELETE /kb/documents/{doc_id}",
+        ],
+    }
+
+
+# ============================================
+# 模块9：程序入口
+# ============================================
+if __name__ == "__main__":
+    import uvicorn
+    log.info(f"启动后端服务: DB={safe_dsn()}, OLLAMA_CHAT={OLLAMA_URL}, EMBED={cfg.EMBED_MODEL}")
+    uvicorn.run("postger_reserve_chat:app", host="127.0.0.1", port=8000)

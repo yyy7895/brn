@@ -1,0 +1,287 @@
+================================================================================
+项目学习成果汇报 —— 本地 RAG 知识库聊天机器人
+================================================================================
+
+一、项目简介
+--------------------------------------------------------------------------------
+【项目名称】本地 RAG 知识库聊天机器人（RAG = Retrieval-Augmented Generation，
+            检索增强生成）
+【项目目的】构建一个纯本地、隐私友好的问答系统：用户上传文档（txt/md/pdf/word）
+            后，AI 会基于文档内容回答问题，而不是基于通用知识编造。
+【解决痛点】
+    1. 通用大模型有知识截止日期，不知道公司/个人私有文档内容。
+    2. 企业机密资料不能上传到云端 LLM API（合规/隐私风险）。
+    3. 微调和蒸馏成本高、不及时（文档更新了就要重训）。
+【技术栈】
+    - 前端：Gradio 6.x（轻量 Web UI，含流式显示、知识库管理 Tab）
+    - 后端：FastAPI + sse_starlette（SSE 流式推送）
+    - 数据库：PostgreSQL 18.4 + pgvector 0.8.6（HNSW 向量索引）
+    - LLM：Ollama 本地部署
+        * 对话模型：deepseek-r1:7b（思考模型，7.6B 参数，Q4_K_M 量化）
+        * 向量化模型：nomic-embed-text（137M，输出 768 维向量）
+    - 数据处理：pypdf（PDF 解析）、python-docx（Word 解析）、httpx/requests（流式 HTTP）
+    - 日志：loguru
+【项目结构】
+    D:\Users\Lenovo\AppData\Programs Trae CN\爬虫\
+    ├── postger_reserve_chat.py   # 后端主程序（FastAPI + API 路由）
+    ├── web.py                    # 前端主程序（Gradio）
+    ├── .env                      # 配置文件（DB_URL、OLLAMA 地址等）
+    ├── pyproject.toml            # 项目依赖声明
+    ├── data\uploads\             # 上传文档存放目录
+    └── src\
+        ├── config.py             # 统一配置 cfg 单例（从 .env 读取）
+        ├── utils\logger.py       # loguru 封装 log
+        └── db\
+        │   ├── connection.py     # SQLAlchemy engine（连接池 + pre_ping）
+        │   ├── schema.sql        # 表结构（chat_history / documents / document_chunks + HNSW 索引）
+        │   └── init_db.py        # 启动幂等建表
+        └── rag\
+            ├── chunking.py       # 文本切块（固定窗口 + overlap）
+            ├── embedding.py      # Ollama /api/embeddings 向量化
+            ├── retriever.py      # pgvector 相似度检索（CAST + HNSW）
+            └── ingest.py         # 文档入库（read_file + 切块 + 向量化 + 入库）
+
+
+二、我做了什么事情
+--------------------------------------------------------------------------------
+
+阶段 1：核心聊天链路搭建与修复
+-----------------------------------------------
+【任务】让前后端跑起来，用户能在 Gradio 聊天框里发消息，AI 流式回复，
+       历史落 PostgreSQL，下次打开能拉历史。
+
+【关键动作】
+    ① 后端 API 设计：
+        - POST /chat/stream  流式对话（SSE）
+        - POST /chat         非流式对话（兜底）
+        - GET  /history      分页历史（{code, data, total, page, page_size}）
+        - GET  /history/delete  清空历史
+    ② 前端 Gradio 流式实现：
+        - chat_with_stream 生成器 + response.iter_lines() 逐行解析 SSE
+        - 实现了 normalize_history（兼容旧 tuple/list 格式 → messages 字典格式）
+        - 【踩坑记录】就地修改 history 导致 UI 不刷新 → 新增 snapshot() 浅拷贝
+          （每次 yield 返回新 list + 新 dict 引用，强制 Gradio 重渲染）
+    ③ 工程化统一：
+        - 新增 src/config.py cfg 单例，所有配置从 .env 读（不再硬编码 DB_URL）
+        - 新增 src/utils/logger.py 用 loguru 替换所有 print
+        - 新增 src/db/connection.py：统一 SQLAlchemy engine（pre_ping 保活）
+
+阶段 2：pgvector 安装 + RAG 知识库核心链路
+-----------------------------------------------
+【任务】让用户能上传文档 → 切块 → 向量化 → 存入 pgvector → 提问时检索
+       top-k 块 → 注入 prompt → LLM 基于文档回答。
+
+【关键动作】
+    ① pgvector 安装（Windows + PG18，坑最多的一步）：
+        - Windows 无官方 pgvector 预编译包 → 从 community 下载官方 v0.8.6-pg18
+          预编译 zip，把 vector.dll 复制到 PG lib 目录，control/sql 复制到 extension
+        - 执行 CREATE EXTENSION vector；校验 SELECT * FROM pg_available_extensions
+        - 【踩坑记录】Windows 服务启动需管理员权限 → 改用 pg_ctl start -D <data_dir>
+    ② 数据库表设计：
+        - documents 表：id, title, source, file_type, chunk_count, created_at
+        - document_chunks 表：id, doc_id(FK CASCADE), chunk_index, content, embedding(vector(768))
+        - 【踩坑记录】一开始用 IVFFlat 索引，小数据集召回为空 → 换 HNSW 索引
+          USING hnsw (embedding vector_cosine_ops)
+    ③ RAG 模块实现（src/rag/ 四个文件）：
+        - embedding.py：embed(text) → 768 维 float list；vec_to_literal 转 pgvector 字串
+        - chunking.py：chunk_text(text, chunk_size=500, overlap=50) 固定窗口切块
+        - retriever.py：pgv_search(q_emb, k=4) 余弦相似度 top-k，返回 doc_id/doc_title/content/score
+          【踩坑记录】:v::vector 语法错误 → 改用 CAST(:v AS vector)
+        - ingest.py：read_file（txt/md/pdf/word）→ chunk_text → 逐块 embed → executemany 批量入库
+          【踩坑记录】参数名 text 遮蔽 sqlalchemy.text → 改 doc_text
+    ④ 知识库 API 路由：
+        - POST   /kb/upload           上传文档 → 存 UPLOAD_DIR + 插 documents 表
+        - POST   /kb/ingest/{doc_id}  触发 切块+向量化+入库
+        - GET    /kb/documents        文档列表
+        - DELETE /kb/documents/{id}   删除文档（级联删块 + 删原文件）
+    ⑤ RAG 集成到 /chat/stream：
+        - 用户问题 → 向量化 → pgv_search top-k → 拼成 system prompt 插入 history[0]
+        - 任何异常 try/except 降级：RAG 挂了也能纯对话，不阻断聊天
+
+阶段 3：deepseek-r1 思考模型流式适配 + 引用溯源
+-----------------------------------------------
+【任务】解决"提问后界面干等 2 分钟没反应、像报错了"的体验问题，
+       并给回答加上引用来源（让用户知道答案从哪来的）。
+
+【关键动作】
+    ① 问题定位：
+        - 写 _probe_ollama_stream.py 探测 deepseek-r1:7b 流式 JSON 结构
+        - 发现 message 字段有 3 个：role、content、thinking
+        - 思考阶段 253 个 chunk 的 content 全是空串，真正文字在 thinking 里
+        - 首非空 content 要等 97.6 秒，用户以为卡死
+    ② 后端修复（postger_reserve_chat.py）：
+        - 同时读 message.content 和 message.thinking
+        - 只在 token or thinking 非空时才 yield，减少 256 次无效空事件下发
+        - httpx timeout 从 120s 放宽到 300s（思考模型慢）
+        - 限制发给 LLM 的历史长度 LLM_HISTORY_LIMIT=10 条（prompt_eval 暴增问题）
+        - 新增 rag_sources 变量，在 done 事件里把检索到的 doc_id/doc_title/chunk_content
+          返回给前端，用于引用溯源展示
+    ③ 前端修复（web.py）：
+        - Chatbot 加 reasoning_tags=[("<thinking>","</thinking>")]
+          Gradio 6.x 自动把标签内容抽成可折叠的「Reasoning」块
+        - build_content 函数：把 thinking 包在 <thinking> 标签里，和 content 拼接
+        - 解析 SSE 的 data 时同时读取 token 和 thinking 字段，逐字累加
+        - 在最终答案末尾追加【引用来源】Markdown 列表（解析 done 事件的 sources 字段）
+
+阶段 4：前端知识库管理 Tab + 多格式文档解析
+-----------------------------------------------
+【任务】让用户能在浏览器界面里上传、查看、删除文档，不需要 curl。
+
+【关键动作】
+    ① Gradio Tabs 布局改造 web.py：
+        - Tab 1：💬 聊天对话（原有功能）
+        - Tab 2：📚 知识库管理（新增）
+    ② 知识库管理 UI 组件：
+        - gr.File 上传组件：支持 txt/md/pdf/docx 多选上传
+        - gr.Button "上传并入库" 按钮：调 /kb/upload 拿 doc_id → 调 /kb/ingest/{doc_id}
+        - gr.Dataframe 文档列表：显示 id/title/file_type/chunk_count/created_at
+        - gr.Number + gr.Button "删除文档"：调 DELETE /kb/documents/{id}
+        - gr.Button "刷新列表"
+    ③ 多格式文档解析增强（ingest.py read_file）：
+        - 新增 .docx 分支：延迟导入 python-docx 的 Document，逐段段落.text 拼接
+        - 原有的 txt/md/pdf 保留
+        - 其他后缀走兜底：按 utf-8 读（失败用 gbk ignore）
+
+阶段 5：对话上下文感知检索（Query Rewriting）
+-----------------------------------------------
+【任务】解决用户问"它是什么？"这种指代性问题时检索不到的问题。
+
+【关键动作】
+    ① 原理：如果 history 里有上下文，当前问题有指代（它/这个/那个），
+       先让 LLM 把问题改写成"完整问题"（不带指代），再拿去向量化+检索。
+    ② 新增 _rewrite_query 函数：
+        - 判断是否需要改写（len(history) > 0 + 问题长度 < 10 字或含指代关键词）
+        - 构造 prompt："把以下用户问题改写成完整独立的问题，结合上文语境。
+          历史对话：xxx。当前问题：yyy。只输出改写后的问题，不要其他文字。"
+        - 调 Ollama /api/chat（非流式）拿结果
+    ③ 集成到 RAG 检索：_retrieve_context(query, recent_history) 里，
+       先跑 query rewriting，再对改写结果 embed 和检索。
+
+阶段 6：Bug 修复与质量保障
+-----------------------------------------------
+    ① ingest.py 语法错误修复：40 行末尾多了个 "4" 字符导致 SyntaxError → 删除
+    ② Gradio 版本校验：确认是 6.20.0，Chatbot 默认 messages 格式
+    ③ Python 进程校验：前端必须用 venv python 启动，不能用系统 python
+       （系统 python 没有 pgvector 相关依赖，启动后实际接口调不通）
+    ④ 端口占用处理：7860/8000 被占用时，找对应 PID Stop-Process，再改启动参数
+    ⑤ PostgreSQL 保活：服务重启后自动 pg_ctl start，engine pre_ping=True
+
+
+三、知识点总结
+--------------------------------------------------------------------------------
+
+知识点 1：SSE（Server-Sent Events）流式通信
+-----------------------------------------------
+【在哪用】后端 /chat/stream → 前端 chat_with_stream 生成器
+【核心概念】HTTP 长连接、服务端单向推送。vs WebSocket：轻量、单向、浏览器原生 EventSource。
+【格式】event: xxx\n data: yyy\n（空行分隔事件）；冒号开头是保活注释。
+【面试考点】为什么不用 WebSocket？（单向推送场景 SSE 更轻量、自动重连、HTTP 兼容）
+【坑】sse_starlette 保活 ping 只在 EventSourceResponse 返回后才发，说明已进入 Ollama 阶段。
+
+知识点 2：RAG（检索增强生成）完整链路
+-----------------------------------------------
+【核心公式】最终答案 = LLM(用户问题 + 检索到的相关文档块 + 指令)
+【完整流程】
+    入库：上传 → 解析文本 → 切块(+overlap) → 逐块向量化 → 存 pgvector
+    问答：问题 → (可选 query rewrite) → 向量化 → 相似度检索 top-k →
+          拼 system prompt → 喂给 LLM 流式生成
+【面试考点】
+    - 为什么 RAG 比微调好？（便宜、即时更新、可溯源、不需要数据）
+    - 什么是 chunk overlap？（切块间的重叠区，防止切断语义）
+    - 检索失败怎么办？（降级，try/except 返回 []，不阻断聊天）
+
+知识点 3：pgvector + 向量相似度检索
+-----------------------------------------------
+【三种距离算子】<=> 余弦距离(文本语义推荐)、<-> 欧氏距离、<#> 负内积
+【score 计算】score = 1 - (embedding <=> query)   # 余弦距离→相似度，0~1 越大越近
+【两种索引】
+    - IVFFlat：分簇近似，需要足够数据训练 lists，对小数据集不友好（召回空）
+    - HNSW：分层可导航小世界图，无需训练、插入即生效、召回稳定、适合小/中数据集
+【SQLAlchemy 坑】用 CAST(:v AS vector)，不要 :v::vector（:: 与命名参数占位符冲突）
+【面试考点】HNSW vs IVFFlat 选型？（小数据集/省心 → HNSW；大数据量内存吃紧 → IVFFlat）
+
+知识点 4：deepseek-r1 思考模型（Reasoning Model）
+-----------------------------------------------
+【特点】先在 thinking 里推理（Chain-of-Thought），再在 content 里出答案。
+【流式结构】message={role:"assistant", content:"", thinking:"推理文字"}
+【坑 & 解决】
+    - 只读 content 会导致思考阶段全程"假死"→ 必须同时读 thinking
+    - 前端展示用 Gradio reasoning_tags + <thinking> 标签 → 可折叠 Reasoning 块
+    - 存库只存 content，thinking 不入库（避免污染历史）
+    - 首 token 极慢（1~2 分钟）→ 放宽 timeout、限制历史长度、只取最近 N 条
+
+知识点 5：Gradio 6.x Chatbot 关键机制
+-----------------------------------------------
+【messages 格式】[{"role":"user"|"assistant"|"system", "content":"text"}, ...]
+【流式刷新关键】每次 yield 必须返回新对象（浅拷贝 snapshot()），否则引用未变不刷新
+【reasoning_tags】[("<thinking>","</thinking>")] → 自动把标签内容抽成折叠的思考块
+【面试考点】为什么不就地修改 history？（Gradio 用引用比较 diff，不是值比较）
+
+知识点 6：SQLAlchemy 工程最佳实践
+-----------------------------------------------
+【防注入】永远用 text("...:name...") + 参数字典，绝不字符串拼接
+【命名参数 vs 类型转换】CAST(:v AS vector) 替代 :v::vector，避免 :: 冲突
+【连接池健康】pool_pre_ping=True，每次取连接前先探测是否存活
+【批量执行】executemany 传 list[dict]，比循环 execute 快 1~2 个数量级
+【变量遮蔽】参数/变量名不要用已导入的名字（如 text、engine、list）→ 改名避冲突
+
+知识点 7：FastAPI + sse_starlette 流式端点
+-----------------------------------------------
+【端点结构】async def chat_stream() -> EventSourceResponse(async_generator)
+【注意事项】
+    - RAG 检索 + 向量化等同步操作用 loop.run_in_executor(ThreadPoolExecutor, ...)
+    - 返回 EventSourceResponse 之前的同步代码不能太长，否则客户端超时等不到 headers
+    - Ollama 请求本身用 httpx.AsyncClient(timeout=300) 异步流式
+【降级】任何异常都要返回 SSE 的 event: error，而不是抛 HTTP 500（前端解析不到）
+
+知识点 8：Query Rewriting（问题改写）
+-----------------------------------------------
+【解决什么问题】多轮对话中"它是什么""这个怎么用"这种指代/省略问题，直接向量化
+    和文档块相似度很低（因为没有实体名），检索不到。
+【怎么做】构造 prompt："结合上文语境，把「XX」改写成完整独立的问题，只输出问题。"
+    调一次非流式 LLM，拿到改写结果 → 再检索。
+【成本】多了一次 LLM 调用，但对体验提升大。可以加启发式过滤：
+    历史为空、问题长度 > 30 字、不含"它/这个/那个/这些"等关键词时跳过。
+
+知识点 9：Windows 本地部署工程坑
+-----------------------------------------------
+【pgvector 安装】PG 主版本号必须匹配（PG18 必须用 v0.8.6-pg18 包），
+    手动复制 dll/control/sql 到 PG 对应目录（Windows 无 apt/pacman）。
+【PostgreSQL 启动】Start-Service 需要管理员权限，普通用户用 pg_ctl start -D <data_dir>
+【进程管理】Windows 端口占用用 Get-NetTCPConnection -LocalPort X -State Listen，
+    找到 OwningProcess 后 Stop-Process -Id（避免 cmd/taskkill 违规）。
+【Python 环境】必须用 venv python.exe（项目依赖装在 venv 里），系统 python 启动
+    后 UI 能打开但接口报错（缺依赖），看起来像"前端启动了但后端挂了"。
+
+
+四、项目成果与验证数据
+--------------------------------------------------------------------------------
+    【后端接口】8 个接口全部跑通（chat/chat_stream/history/delete + 4 个 KB）
+    【数据库】chat_history 表 29+ 条记录；documents 表已有测试文档 1 份（13 块）
+    【流式验证】Ollama 直调 3 秒返回；修复后 thinking 实时下发；首 thinking 出现
+        时间 ~56 秒，首 content 时间 ~103 秒（deepseek-r1:7b 原生速度）
+    【RAG 验证】问知识库专有问题（如文档中的邮箱 ares-team@example.com），
+        AI 能从参考资料中给出正确答案
+    【向量召回】nomic-embed-text 768 维，HNSW 索引，top-k=4 稳定命中文档块
+    【UI 能力】Gradio 界面含 2 个 Tab（聊天 / KB 管理），支持文件上传、文档
+        列表、删除、问答流式显示、思考折叠、引用溯源展示
+
+
+五、下一步可扩展方向（面试加分项）
+--------------------------------------------------------------------------------
+    1. 混合检索（Hybrid Search）：pgvector 语义检索 + PostgreSQL tsvector 关键词
+       全文检索，再用 RRF 融合排序，召回率更高。
+    2. 对话摘要（Conversation Summary）：历史超过阈值时用 LLM 摘要成一段，
+       防止 prompt 无限变长。
+    3. 重排序（Rerank）：向量粗排 top-50 → BGE-Rerank 精排 top-5，答案更准。
+    4. 多用户权限：现在 user_id 只是前端输入字符串，应加 JWT 鉴权 middleware。
+    5. 异步入库：文件较大时 /kb/ingest 会阻塞 → 用 Celery/APScheduler 后台任务。
+    6. Docker 化：写 Dockerfile + docker-compose（pg + ollama + backend + frontend），
+       一键部署，面试时展示 DevOps 能力。
+    7. 单元测试：pytest 覆盖 read_file/chunk_text/pgv_search，mock Ollama/DB。
+    8. 结构化文档解析：PDF 表格、图片 OCR（PaddleOCR），而不是纯文本抽取。
+
+
+================================================================================
+汇报完毕 | 生成时间：2026-08-10
+================================================================================

@@ -1,0 +1,16 @@
+# 环境变量（含数据库密码，勿提交）
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 上传的文档
+data/uploads/
+
+# 临时脚本
+_check_pg.py
+_install_pgvector.py
+_install_pgvector_copy.py
+_test_embed.py
