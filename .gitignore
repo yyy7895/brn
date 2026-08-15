@@ -9,8 +9,24 @@ __pycache__/
 # 上传的文档
 data/uploads/
 
-# 临时脚本
+# IDE / 工具缓存
+.gradio/
+.trae/
+
+# 日志
+*.log
+
+# 临时调试脚本
 _check_pg.py
+_check_gradio.py
 _install_pgvector.py
 _install_pgvector_copy.py
 _test_embed.py
+_probe_backend_stream.py
+_probe_ollama_stream.py
+_repro_chat.py
+
+# 个人笔记
+面试知识点总结_RAG聊天机器人.txt
+项目学习成果汇报_RAG知识库聊天机器人.txt
+多并发.py
