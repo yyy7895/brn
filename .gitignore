@@ -30,3 +30,8 @@ _repro_chat.py
 面试知识点总结_RAG聊天机器人.txt
 项目学习成果汇报_RAG知识库聊天机器人.txt
 多并发.py
+
+# 流程图与测试样本文档（不纳入版本控制）
+代码执行流程图.drawio
+代码执行流程图.png
+sample_kb.txt

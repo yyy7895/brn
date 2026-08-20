@@ -1,9 +1,15 @@
 # ============================================
 # 模块1：导入依赖
 # ============================================
+import os
+from datetime import datetime
+
 import gradio as gr
 import requests
 import json
+
+# 后端服务地址（FastAPI 默认 8000 端口）
+BACKEND = "http://127.0.0.1:8000"
 
 # ============================================
 # 模块2：辅助函数
@@ -40,7 +46,7 @@ def load_history(user_id):
             params={"user_id": user_id, "page": 1, "page_size": 50},
             timeout=10,
         )
-        resp.raise_for_status()
+        resp.raise_for_status()#常用请求状态码检查判断，确保请求成功
         data = resp.json()
         raw = data.get("data", []) if isinstance(data, dict) else []
         # 后端格式: [{"user_content":..., "bot_content":...}, ...]
@@ -59,6 +65,102 @@ def load_history(user_id):
         return []
 
 
+# ============================================
+# 模块2扩展：知识库管理辅助函数
+# ============================================
+# 后端已提供：
+#   POST   /kb/upload          上传文件 → 落 documents 表，返回 doc_id
+#   POST   /kb/ingest/{doc_id} 切块 + 向量化 + 入 document_chunks 表
+#   GET    /kb/documents       文档列表
+#   DELETE /kb/documents/{id}  删除文档（级联删块）
+# 下列函数把这些后端能力接到前端 UI。
+#
+# 【requests multipart 上传】
+#   requests.post(url, files={"file": (上传文件名, 文件句柄)})
+#   会以 multipart/form-data 发送，后端 FastAPI 用 UploadFile = File(...) 接收。
+
+
+def refresh_doc_list():
+    """拉取已入库文档列表，返回 Dataframe 行数据（list of list）。"""
+    try:
+        resp = requests.get(f"{BACKEND}/kb/documents", timeout=10)
+        resp.raise_for_status()
+        data = resp.json().get("data", [])
+        # 顺序与 Dataframe headers 对齐
+        rows = []
+        for d in data:
+            rows.append([
+                d.get("id"),
+                d.get("title"),
+                d.get("file_type"),
+                d.get("chunk_count"),
+                d.get("created_at"),
+            ])
+        return rows
+    except Exception as e:
+        print(f"[refresh_doc_list] 加载失败: {e}")
+        return []
+
+
+def upload_and_ingest(file):
+    """
+    一键上传并入库：上传文件 → 后端落库拿 doc_id → 触发切块+向量化。
+    入参 file：gr.File(type="filepath") 返回的临时文件路径字符串（保留原扩展名）。
+    返回：(状态 Markdown, 刷新后的文档列表)。
+    """
+    if not file:
+        return "⚠️ 请先选择文件", refresh_doc_list()
+    try:
+        # gr.File(type="filepath") 返回临时路径，扩展名保留，据此判断类型
+        ext = os.path.splitext(file)[1].lower()
+        if ext not in (".txt", ".md", ".pdf"):
+            return f"⚠️ 不支持的类型 {ext}，仅支持 .txt / .md / .pdf", refresh_doc_list()
+
+        # 构造带扩展名的上传文件名（后端按扩展名校验、用文件名取标题）
+        filename = f"upload_{datetime.now().strftime('%Y%m%d%H%M%S')}{ext}"
+
+        # 1) multipart 上传：files={"file": (filename, 句柄)}
+        with open(file, "rb") as f:
+            resp = requests.post(
+                f"{BACKEND}/kb/upload",
+                files={"file": (filename, f)},
+                timeout=120,
+            )
+        resp.raise_for_status()
+        doc_id = resp.json()["data"]["doc_id"]
+
+        # 2) 触发切块 + 向量化入库（大文档慢，timeout 放宽到 300s）
+        resp2 = requests.post(
+            f"{BACKEND}/kb/ingest/{doc_id}",
+            timeout=300,
+        )
+        resp2.raise_for_status()
+        n = resp2.json()["data"]["chunk_count"]
+        return (
+            f"✅ 入库成功：doc_id={doc_id}，切分 **{n}** 块。\n\n"
+            f"AI 现在可在回答你的问题时检索此文档并引用。",
+            refresh_doc_list(),
+        )
+    except Exception as e:
+        return f"❌ 上传/入库失败: {e}", refresh_doc_list()
+
+
+def delete_kb_document(doc_id):
+    """删除指定文档（级联删块 + 删原文件），返回状态 + 刷新后的列表。"""
+    if not doc_id:
+        return "⚠️ 请输入要删除的 doc_id", refresh_doc_list()
+    try:
+        # requests.delete 发 HTTP DELETE 请求
+        resp = requests.delete(
+            f"{BACKEND}/kb/documents/{int(doc_id)}",
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return f"✅ 已删除文档 {int(doc_id)}", refresh_doc_list()
+    except Exception as e:
+        return f"❌ 删除失败: {e}", refresh_doc_list()
+
+
 def chat_with_stream(message, history, user_id):
     """
     流式生成器：调后端 /chat/stream SSE，逐 token yield 回 messages 格式历史。
@@ -75,7 +177,7 @@ def chat_with_stream(message, history, user_id):
 
     def snapshot(h):
         """对 messages 做一层浅拷贝，保证每次 yield 返回新的引用。"""
-        return [dict(m) for m in h]
+        return [dict(m) for m in h]#把history中的每个元素转换为字典，确保每次 yield 返回新的引用，避免修改原对象
 
     def build_content(thinking, answer):
         """把思考内容包进 <thinking> 标签，交给 Chatbot reasoning_tags 折叠展示。"""
@@ -98,7 +200,8 @@ def chat_with_stream(message, history, user_id):
             stream=True,
             timeout=600,          # deepseek-r1 思考阶段可能 1-2 分钟
         )
-        response.raise_for_status()
+        response.raise_for_status()#检查 HTTP 请求的响应状态，如果状态码是 4xx 或 5xx（即请求失败），就抛出异常，用于快速发现网络或接口错误。
+
     except Exception as e:
         history[-1]["content"] = f"[连接后端失败] {e}"
         yield snapshot(history)
@@ -199,6 +302,36 @@ def build_demo():
             submit_btn=True,
         )
 
+        # ===== 知识库管理（上传文档供 AI 检索回答）=====
+        # gr.Accordion：可折叠面板，默认折叠不占聊天空间
+        # gr.File：文件上传组件，file_types 限制扩展名，type="filepath" 返回路径字符串
+        with gr.Accordion("📚 知识库管理（上传文档供 AI 检索回答）", open=False):
+            gr.Markdown(
+                "上传 `.txt / .md / .pdf` 文档，后端会自动 **解析 → 切块 → 向量化入库**。\n"
+                "入库后，AI 回答你的问题时会自动检索这些文档并引用（RAG）。"
+            )
+            with gr.Row():
+                kb_file = gr.File(
+                    label="选择文档",
+                    file_types=[".txt", ".md", ".pdf"],
+                    type="filepath",
+                    scale=4,
+                )
+                upload_btn = gr.Button("📤 上传并入库", variant="primary", scale=1)
+            upload_status = gr.Markdown("", label="上传状态")
+
+            gr.Markdown("### 已入库文档")
+            with gr.Row():
+                refresh_kb_btn = gr.Button("🔄 刷新列表", scale=1)
+                del_doc_id = gr.Number(label="删除文档ID", value=None, scale=2)
+                del_kb_btn = gr.Button("🗑️ 删除", scale=1)
+            doc_table = gr.Dataframe(
+                headers=["doc_id", "标题", "类型", "块数", "创建时间"],
+                value=refresh_doc_list,
+                interactive=False,
+                wrap=True,
+            )
+
         # ===== 事件绑定 =====
         # 1) 发送消息：流式生成
         msg.submit(
@@ -221,6 +354,25 @@ def build_demo():
             load_history,
             inputs=[user_id_input],
             outputs=chatbot,
+        )
+
+        # 4) 知识库：一键上传并入库（上传 → 切块 → 向量化）
+        upload_btn.click(
+            upload_and_ingest,
+            inputs=[kb_file],
+            outputs=[upload_status, doc_table],
+        )
+        # 5) 知识库：刷新文档列表
+        refresh_kb_btn.click(
+            refresh_doc_list,
+            inputs=None,
+            outputs=doc_table,
+        )
+        # 6) 知识库：删除指定文档（级联删块）
+        del_kb_btn.click(
+            delete_kb_document,
+            inputs=[del_doc_id],
+            outputs=[upload_status, doc_table],
         )
 
     return demo

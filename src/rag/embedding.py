@@ -15,6 +15,11 @@ import httpx
 from src.config import cfg
 from src.utils.logger import log
 
+# 模块级共享 HTTP 客户端：复用 TCP 连接，避免每次 embed() 都重新握手。
+# 入库时 N 个块 = N 次请求，旧实现每次 with httpx.Client() 都新建连接，开销很大。
+# httpx.Client 内置连接池，在同进程内可安全复用（CPython GIL 下并发请求由连接池调度）。
+_embed_client = httpx.Client(timeout=60.0)
+
 
 def embed(text: str) -> List[float]:
     """
@@ -22,19 +27,17 @@ def embed(text: str) -> List[float]:
     调用 Ollama 的 /api/embeddings 接口：
       请求体: {"model": "nomic-embed-text", "prompt": "<文本>"}
       返回体: {"embedding": [0.01, -0.03, ...]}  长度 768
-    httpx.Client 是同步 HTTP 客户端（同进程内复用连接）。
     """
     text = (text or "").strip()
     if not text:
         return []
     try:
-        with httpx.Client(timeout=60.0) as client:
-            resp = client.post(
-                cfg.OLLAMA_EMBED_URL,
-                json={"model": cfg.EMBED_MODEL, "prompt": text},
-            )
-            resp.raise_for_status()
-            return resp.json().get("embedding", [])
+        resp = _embed_client.post(
+            cfg.OLLAMA_EMBED_URL,
+            json={"model": cfg.EMBED_MODEL, "prompt": text},
+        )
+        resp.raise_for_status()
+        return resp.json().get("embedding", [])
     except Exception as e:
         log.error(f"【向量化失败】{repr(e)}")
         return []

@@ -32,7 +32,7 @@ from src.config import cfg
 from src.db.connection import engine, safe_dsn
 from src.db.init_db import init_db
 from src.rag.embedding import embed
-from src.rag.retriever import pgv_search
+from src.rag.retriever import pgv_search, rerank_mmr
 from src.rag import ingest as rag_ingest
 
 # ============================================
@@ -59,14 +59,24 @@ def _on_startup():
 
 def _retrieve_context(query: str) -> list:
     """
-    RAG 检索：把用户问题向量化 -> pgvector 取 top-k 块。
+    RAG 检索：把用户问题向量化 -> pgvector 取候选 -> MMR 重排取 top-k。
     任何异常都返回空列表（降级为纯对话，不阻断聊天）。
     """
     try:
         q_emb = embed(query)
         if not q_emb:
             return []
-        return pgv_search(q_emb)
+        # 优化7：先召回较多候选（目标数×5），再用 MMR 重排去冗余、提多样性。
+        # 召回需要 embedding 列供 MMR 计算块间相似度。
+        rerank_pool = cfg.TOP_K * 5
+        candidates = pgv_search(q_emb, top_k=rerank_pool, return_embedding=True)
+        if not candidates:
+            return []
+        ranked = rerank_mmr(q_emb, candidates, cfg.TOP_K)
+        # 重排后 embedding 不再需要，移除以免带到上层 / 序列化进 sources
+        for r in ranked:
+            r.pop("embedding", None)
+        return ranked
     except Exception as e:
         log.warning(f"【RAG 检索失败，降级为纯对话】{repr(e)}")
         return []
@@ -87,19 +97,37 @@ def save_record(user_id: str, user_msg: str, bot_msg: str):
         conn.commit()
 
 
-def get_history_messages(user_id: str):
+def get_history_messages(user_id: str, limit: int | None = None):
     """
-    读取用户全部历史对话 -> 拼 LLM messages 格式
-    [{role, content}, ...] —— 用于塞进 Ollama 的 messages
+    读取用户历史对话 -> 拼 LLM messages 格式 [{role, content}, ...]。
+
+    limit：只取最近 N 条记录（按时间正序返回，供 LLM 使用）。
+      旧实现先拉全量再在 Python 里切片，历史上万条时浪费严重；
+      现在 SQL 层用子查询 DESC LIMIT 取最近 N 条，再外层 ASC 还原时间顺序，
+      DB 只回传需要的数据。
+      limit=None 时查全量（保留旧语义，兼容 list_history 等场景）。
     """
-    sql = text(
-        "SELECT user_content, bot_content "
-        "FROM chat_history "
-        "WHERE user_id=:uid "
-        "ORDER BY creat_time ASC"
-    )
+    if limit and limit > 0:
+        # 子查询取最近 limit 条（DESC），外层 ASC 还原为时间正序
+        sql = text(
+            "SELECT user_content, bot_content FROM ("
+            "SELECT user_content, bot_content, creat_time "
+            "FROM chat_history WHERE user_id=:uid "
+            "ORDER BY creat_time DESC LIMIT :lim"
+            ") t ORDER BY t.creat_time ASC"
+        )
+        params = {"uid": user_id, "lim": int(limit)}
+    else:
+        sql = text(
+            "SELECT user_content, bot_content "
+            "FROM chat_history "
+            "WHERE user_id=:uid "
+            "ORDER BY creat_time ASC"
+        )
+        params = {"uid": user_id}
+
     with engine.connect() as conn:
-        rows = conn.execute(sql, {"uid": user_id}).fetchall()
+        rows = conn.execute(sql, params).fetchall()
     msg_list = []
     for u_txt, b_txt in rows:
         msg_list.append({"role": "user", "content": u_txt})
@@ -146,23 +174,35 @@ def list_history_records(user_id: str, page: int = 1, page_size: int = 50):
 async def chat_stream(user_id: str, current_msg: str):
     try:
         loop = asyncio.get_running_loop()
-        history = await loop.run_in_executor(executor, get_history_messages, user_id)
-        # 限制发给 LLM 的历史长度：DB 存全量，发给 deepseek-r1 只取最近 N 条。
-        # 否则历史越长 prompt_eval 越慢，思考模型首 token 动辄 1~2 分钟甚至超时。
+        # 优化2：直接 SQL 取最近 10 条（DB 层 LIMIT），避免拉全量再 Python 切片。
+        # 思考模型 prompt_eval 随历史增长变慢，限制条数保证首 token 速度。
         LLM_HISTORY_LIMIT = 10
-        if len(history) > LLM_HISTORY_LIMIT:
-            history = history[-LLM_HISTORY_LIMIT:]
+        history = await loop.run_in_executor(
+            executor, get_history_messages, user_id, LLM_HISTORY_LIMIT
+        )
         history.append({"role": "user", "content": current_msg})
 
         # ---- RAG：向量化用户问题 + pgvector 检索 top-k 块，拼成 system prompt ----
         # 增加变量存储检索结果，用于最终的引用溯源
         rag_sources = []
         retrieved = await loop.run_in_executor(executor, _retrieve_context, current_msg)
+        # 优化4：score 阈值过滤。低相关块（如库内无答案时召回的噪声）会误导模型，
+        # 只保留相似度 >= RAG_SCORE_THRESHOLD 的块；过滤后为空则降级为纯对话。
+        RAG_SCORE_THRESHOLD = 0.3
         if retrieved:
-            context = "\n---\n".join(r["content"] for r in retrieved)
+            retrieved = [r for r in retrieved if r.get("score", 0) >= RAG_SCORE_THRESHOLD]
+        if retrieved:
+            # 优化6：context 标注来源[资料N: title]，让模型可溯源；
+            # 前端 rag_sources 顺序与此处编号一一对应，便于引用展示。
+            context_parts = []
+            for idx, r in enumerate(retrieved, 1):
+                title = r.get("doc_title", "未知文档")
+                context_parts.append(f"[资料{idx}: {title}]\n{r['content']}")
+            context = "\n---\n".join(context_parts)
             system_prompt = (
                 "你是一个知识库问答助手。请优先依据下面提供的资料回答用户问题；"
-                "若资料中没有答案，请如实说明，不要编造。\n\n【参考资料】\n" + context
+                "若资料中没有答案，请如实说明，不要编造。"
+                "回答时可标注引用的资料编号（如[资料1]）。\n\n【参考资料】\n" + context
             )
             history.insert(0, {"role": "system", "content": system_prompt})
             # 把检索到的文档信息（id, title, content）存下来，返回给前端做引用
@@ -215,11 +255,19 @@ async def chat_stream(user_id: str, current_msg: str):
                             }
 
                         if chunk_data.get("done", False):
-                            await loop.run_in_executor(
-                                executor,
-                                save_record,
-                                user_id, current_msg, full_response,
-                            )
+                            # 优化3：后台异步写库，立即返回 done 事件，不等 DB commit。
+                            # 旧实现 await 写库完成才发 done，用户要白等一次磁盘 IO；
+                            # 现在用 asyncio.create_task 托管，失败也只记日志，
+                            # 不影响已生成的回复下发给前端。
+                            async def _bg_save():
+                                try:
+                                    await loop.run_in_executor(
+                                        executor, save_record,
+                                        user_id, current_msg, full_response,
+                                    )
+                                except Exception as save_err:
+                                    log.error(f"【后台存库失败】{repr(save_err)}")
+                            asyncio.create_task(_bg_save())
                             # 把检索到的 sources 返回给前端，用于引用溯源展示
                             yield {
                                 "event": "done",
