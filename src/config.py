@@ -41,14 +41,20 @@ _load_env(PROJECT_ROOT / ".env")
 class Config:
     """全局配置单例（实例化为 cfg）。所有值来自环境变量（已含 .env）。"""
 
-    # ---- Ollama ----
-    # OLLAMA_BASE：Ollama 服务根地址，聊天与向量化接口都挂在它下面
+    # ---- Ollama（仅向量化用；聊天已切换到官方 DeepSeek API）----
+    # OLLAMA_BASE：Ollama 服务根地址，向量化接口挂在它下面
     OLLAMA_BASE: str = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
-    # 聊天模型（流式生成回答）
-    CHAT_MODEL: str = os.getenv("CHAT_MODEL", "deepseek-r1:7b")
     # 向量化模型：nomic-embed-text，输出 768 维向量
     EMBED_MODEL: str = os.getenv("EMBED_MODEL", "nomic-embed-text")
     EMBED_DIM: int = int(os.getenv("EMBED_DIM", "768"))
+
+    # ---- DeepSeek 官方 API（聊天生成，经 LlamaIndex 调用）----
+    # DEEPSEEK_API_KEY：在 .env 配置（必填，否则聊天会报 401）
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    # 聊天模型：可选 deepseek-v4-pro / deepseek-v4-flash / deepseek-chat / deepseek-reasoner
+    # （deepseek-reasoner 带 reasoning_content 思考过程，对应前端 <thinking> 折叠块）
+    CHAT_MODEL: str = os.getenv("CHAT_MODEL", "deepseek-v4-flash")
 
     # ---- 数据库 ----
     DB_URL: str = os.getenv(

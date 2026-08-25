@@ -34,15 +34,15 @@ from src.db.init_db import init_db
 from src.rag.embedding import embed
 from src.rag.retriever import pgv_search, rerank_mmr
 from src.rag import ingest as rag_ingest
+from src.llm import deepseek_client as llm_ds
 
 # ============================================
 # 模块2：基础配置（统一从 cfg 读取，保留旧变量名做别名，老代码无感）
 # ============================================
 app = FastAPI(title="本地聊天机器人后端 + RAG")
 
-# 别名：让下方原有逻辑（用 OLLAMA_URL / MODEL_NAME / DB_URL / engine 名字）继续可用
-OLLAMA_URL = cfg.OLLAMA_CHAT_URL      # Ollama 聊天接口
-MODEL_NAME = cfg.CHAT_MODEL
+# 聊天生成已切换到 LlamaIndex 调用官方 DeepSeek（见 src/llm/deepseek_client.py）
+# 向量化仍用 Ollama nomic-embed-text（embedding.py 内部引用 cfg.OLLAMA_EMBED_URL）
 DB_URL = cfg.DB_URL
 # engine 复用 src/db/connection.py 的全局共享连接池
 executor = ThreadPoolExecutor()
@@ -213,69 +213,43 @@ async def chat_stream(user_id: str, current_msg: str):
                     "chunk_content": r["content"][:100] + "..." if len(r["content"]) > 100 else r["content"]
                 })
 
-        ollama_payload = {
-            "model": MODEL_NAME,
-            "messages": history,
-            "stream": True,
-        }
-
         async def generate():
             full_response = ""   # 只累计正式回答（content），存库用
-            full_thinking = ""   # 累计思考内容（thinking），不存库、仅前端展示
-            # 思考模型（deepseek-r1）思考阶段可能持续 1~2 分钟，超时放宽到 300s
-            async with httpx.AsyncClient(timeout=300.0) as client:
-                async with client.stream("POST", OLLAMA_URL, json=ollama_payload) as response:
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            chunk_data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-
-                        if "message" not in chunk_data:
-                            continue
-                        msg = chunk_data["message"]
-                        token = msg.get("content", "")
-                        # deepseek-r1 等思考模型：思考阶段 content 为空，真正文字在 thinking 字段
-                        thinking = msg.get("thinking", "")
-                        full_response += token
-                        full_thinking += thinking
-
-                        # 只在有实质内容（token 或 thinking）时下发，
-                        # 否则思考阶段会刷一堆空 token 事件、徒增前端解析压力
-                        if token or thinking:
-                            yield {
-                                "event": "message",
-                                "data": json.dumps({
-                                    "token": token,
-                                    "thinking": thinking,
-                                    "done": chunk_data.get("done", False),
-                                }),
-                            }
-
-                        if chunk_data.get("done", False):
-                            # 优化3：后台异步写库，立即返回 done 事件，不等 DB commit。
-                            # 旧实现 await 写库完成才发 done，用户要白等一次磁盘 IO；
-                            # 现在用 asyncio.create_task 托管，失败也只记日志，
-                            # 不影响已生成的回复下发给前端。
-                            async def _bg_save():
-                                try:
-                                    await loop.run_in_executor(
-                                        executor, save_record,
-                                        user_id, current_msg, full_response,
-                                    )
-                                except Exception as save_err:
-                                    log.error(f"【后台存库失败】{repr(save_err)}")
-                            asyncio.create_task(_bg_save())
-                            # 把检索到的 sources 返回给前端，用于引用溯源展示
-                            yield {
-                                "event": "done",
-                                "data": json.dumps({
-                                    "full_response": full_response,
-                                    "sources": rag_sources,  # 新增字段
-                                }),
-                            }
+            full_thinking = ""   # 累计思考内容（reasoning_content），不存库、仅前端展示
+            # 经 LlamaIndex 流式调官方 DeepSeek，逐 chunk 取 content + reasoning_content
+            # reasoning_content 仅 reasoner 模型有；非思考模型 thinking 为空，前端不显示思考块
+            async for token, thinking in llm_ds.stream_chat(history):
+                full_response += token
+                full_thinking += thinking
+                # 只在有实质内容（token 或 thinking）时下发，避免空事件刷屏
+                if token or thinking:
+                    yield {
+                        "event": "message",
+                        "data": json.dumps({
+                            "token": token,
+                            "thinking": thinking,
+                            "done": False,
+                        }),
+                    }
+            # 流自然结束即 done（DeepSeek 流式无独立 done chunk）
+            # 优化3：后台异步写库，立即返回 done，不等 DB commit
+            async def _bg_save():
+                try:
+                    await loop.run_in_executor(
+                        executor, save_record,
+                        user_id, current_msg, full_response,
+                    )
+                except Exception as save_err:
+                    log.error(f"【后台存库失败】{repr(save_err)}")
+            asyncio.create_task(_bg_save())
+            # 把检索到的 sources 返回给前端，用于引用溯源展示
+            yield {
+                "event": "done",
+                "data": json.dumps({
+                    "full_response": full_response,
+                    "sources": rag_sources,
+                }),
+            }
 
         return EventSourceResponse(generate())
 
@@ -344,13 +318,8 @@ def chat(user_id: str, current_msg: str):
     try:
         history = get_history_messages(user_id)
         history.append({"role": "user", "content": current_msg})
-        res = requests.post(
-            OLLAMA_URL,
-            json={"model": MODEL_NAME, "messages": history, "stream": False},
-            timeout=120,
-        )
-        res.raise_for_status()
-        bot_ans = res.json()["message"]["content"]
+        # 经 LlamaIndex 同步调官方 DeepSeek（非流式）
+        bot_ans = llm_ds.chat(history)
         save_record(user_id, current_msg, bot_ans)
         return {
             "user_id": user_id,
@@ -469,5 +438,5 @@ def root():
 # ============================================
 if __name__ == "__main__":
     import uvicorn
-    log.info(f"启动后端服务: DB={safe_dsn()}, OLLAMA_CHAT={OLLAMA_URL}, EMBED={cfg.EMBED_MODEL}")
+    log.info(f"启动后端服务: DB={safe_dsn()}, CHAT=DeepSeek/{cfg.CHAT_MODEL}, EMBED={cfg.EMBED_MODEL}")
     uvicorn.run("postger_reserve_chat:app", host="127.0.0.1", port=8000)
