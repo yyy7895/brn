@@ -1,22 +1,25 @@
 # RAG 知识库聊天机器人
 
-基于 RAG（检索增强生成）的本地知识库聊天机器人，支持文档上传、向量化检索、流式对话和历史记录持久化。
+基于 RAG（检索增强生成）的知识库聊天机器人，支持文档上传、向量化检索、流式对话、思考过程展示和历史记录持久化。聊天生成走 DeepSeek 官方 API，向量化走本地 Ollama。
 
 ## 项目架构
 
 ```
-用户 <-> Gradio 前端 (web.py) <-> FastAPI 后端 (postger_reserve_chat.py)
+用户 <-> Gradio 前端 (web.py, :7860) <-> FastAPI 后端 (postger_reserve_chat.py, :8000)
                                         |
                           +-------------+-------------+
                           |             |             |
-                     Ollama LLM    PostgreSQL    RAG 检索
-                   (deepseek-r1)  (聊天历史)    (pgvector)
+                  DeepSeek API      PostgreSQL      RAG 检索
+                 (deepseek-v4-       (聊天历史)      (pgvector)
+                   flash 聊天)     + Ollama embedding
+                                  (nomic-embed-text)
 ```
 
 ## 核心功能
 
-- **流式对话**：基于 Ollama + deepseek-r1:7b，支持思考过程实时展示
-- **RAG 知识库**：上传文档（TXT/MD/PDF）→ 文本切块 → 向量化 → pgvector 余弦相似检索 → 注入 Prompt
+- **流式对话**：DeepSeek 官方 API（deepseek-v4-flash），思考过程实时折叠展示
+- **RAG 知识库**：上传文档（TXT/MD/PDF）→ 段落切块 → Ollama 向量化 → pgvector 余弦相似检索 + MMR 重排 → 注入 Prompt
+- **引用溯源**：回答标注资料编号，结尾展示引用来源列表
 - **聊天历史**：PostgreSQL 持久化存储，支持多用户隔离
 - **多用户支持**：通过 user_id 区分不同用户的对话历史
 
@@ -26,31 +29,34 @@
 |------|------|
 | 前端 | Gradio 6.x（流式输出 + reasoning 折叠） |
 | 后端 | FastAPI + sse-starlette（SSE 流式推送） |
-| LLM | Ollama（deepseek-r1:7b 聊天 / nomic-embed-text 向量化） |
-| 数据库 | PostgreSQL + pgvector（向量相似检索） |
+| 聊天 LLM | DeepSeek 官方 API（deepseek-v4-flash，经 LlamaIndex + httpx） |
+| 向量化 | Ollama nomic-embed-text（768 维） |
+| 数据库 | PostgreSQL 18 + pgvector（HNSW 向量索引） |
 | ORM | SQLAlchemy |
 
 ## 项目结构
 
 ```
 RAG/
-├── web.py                      # Gradio 前端：聊天界面
-├── postger_reserve_chat.py     # FastAPI 后端：聊天 + RAG 接口
-├── build_knowledge.py          # 知识库构建入口
-├── config.yaml                 # 爬虫配置（学习通题目爬虫）
+├── web.py                      # Gradio 前端：聊天 + 知识库管理面板
+├── postger_reserve_chat.py     # FastAPI 后端：聊天 + RAG + KB 接口
+├── requirements                # 依赖清单
 ├── pyproject.toml              # 项目依赖声明
 ├── .env.example                # 环境变量模板
-├── sample_kb.txt               # 示例知识库文本
+├── .env                        # 本地配置（DB_URL、DEEPSEEK_API_KEY，不入库）
 ├── src/
 │   ├── config.py               # 集中配置（从 .env 读取）
 │   ├── db/
 │   │   ├── connection.py       # 数据库连接池（SQLAlchemy engine）
-│   │   ├── init_db.py          # 建表脚本入口
-│   │   └── schema.sql          # RAG 表结构（documents / document_chunks）
+│   │   ├── init_db.py          # 启动幂等建表
+│   │   └── schema.sql          # RAG 表结构（documents / document_chunks + HNSW）
+│   ├── llm/
+│   │   ├── __init__.py
+│   │   └── deepseek_client.py  # DeepSeek 封装（流式 httpx / 非流式 LlamaIndex）
 │   ├── rag/
-│   │   ├── chunking.py         # 文本切块（固定窗口 + overlap）
+│   │   ├── chunking.py         # 文本切块（按段落 + 超长窗口二次切）
 │   │   ├── embedding.py        # 向量化（调 Ollama /api/embeddings）
-│   │   ├── retriever.py        # pgvector 余弦相似检索
+│   │   ├── retriever.py        # pgvector 余弦相似检索 + MMR 重排
 │   │   └── ingest.py           # 文档入库：读取→切块→向量化→写入DB
 │   └── utils/
 │       └── logger.py           # 日志（loguru）
@@ -62,8 +68,9 @@ RAG/
 ### 1. 环境准备
 
 - Python >= 3.8
-- PostgreSQL（需安装 pgvector 扩展）
-- [Ollama](https://ollama.com/) 本地服务
+- PostgreSQL 18（需安装 pgvector 扩展，Windows 用官方 v0.8.6-pg18 预编译包）
+- [Ollama](https://ollama.com/) 本地服务（仅向量化用）
+- DeepSeek 官方 API Key（[platform.deepseek.com](https://platform.deepseek.com) 申请）
 
 ### 2. 安装依赖
 
@@ -73,10 +80,9 @@ pip install -r requirements
 pip install .
 ```
 
-### 3. 拉取 Ollama 模型
+### 3. 拉取 Ollama 向量化模型
 
 ```bash
-ollama pull deepseek-r1:7b
 ollama pull nomic-embed-text
 ```
 
@@ -84,15 +90,17 @@ ollama pull nomic-embed-text
 
 ```bash
 cp .env.example .env
-# 编辑 .env，填入你的 PostgreSQL 连接信息
+# 编辑 .env，填入你的 PostgreSQL 连接信息 + DEEPSEEK_API_KEY
 ```
 
 关键配置项：
 
 | 变量 | 说明 | 默认值 |
 |------|------|--------|
-| `OLLAMA_BASE` | Ollama 服务地址 | `http://127.0.0.1:11434` |
-| `CHAT_MODEL` | 聊天模型 | `deepseek-r1:7b` |
+| `OLLAMA_BASE` | Ollama 服务地址（向量化用） | `http://127.0.0.1:11434` |
+| `CHAT_MODEL` | 聊天模型 | `deepseek-v4-flash` |
+| `DEEPSEEK_API_KEY` | DeepSeek 官方 Key（必填） | 空 |
+| `DEEPSEEK_BASE_URL` | DeepSeek API 地址 | `https://api.deepseek.com` |
 | `EMBED_MODEL` | 向量化模型 | `nomic-embed-text` |
 | `EMBED_DIM` | 向量维度 | `768` |
 | `DB_URL` | PostgreSQL 连接串 | - |
@@ -108,12 +116,14 @@ psql -U postgres -d your_db -f src/db/schema.sql
 
 ### 6. 启动服务
 
+> 注意：必须使用项目 venv 的 python（依赖装在 venv 里），系统 python 启动后接口会缺依赖报错。
+
 ```bash
 # 终端1：启动后端（默认 8000 端口）
-python postger_reserve_chat.py
+.venv\Scripts\python postger_reserve_chat.py
 
 # 终端2：启动前端（默认 7860 端口）
-python web.py
+.venv\Scripts\python web.py
 ```
 
 浏览器访问 `http://127.0.0.1:7860` 即可使用。
@@ -121,25 +131,32 @@ python web.py
 ## RAG 工作流程
 
 ```
-文档上传 → 读取文本 → 切块(chunk_size=500, overlap=50)
+【入库】文档上传 → 按段落切块(超长段 500 字符 + 50 overlap 二次切)
     → 逐块向量化(nomic-embed-text, 768维)
-    → 写入 document_chunks 表
+    → 写入 document_chunks 表(HNSW 索引)
 
-用户提问 → 问题向量化
-    → pgvector 余弦相似检索 TOP_K 个相关块
-    → 拼接为 context 注入 Prompt
-    → Ollama 流式生成回答
+【检索】用户提问 → 问题向量化
+    → pgvector 余弦相似召回 TOP_K×5 候选
+    → MMR 重排去冗余取 TOP_K → 过滤 score<0.3 噪声块
+    → 拼接 [资料N: 标题] 注入 Prompt
+
+【生成】system(资料) + 最近10条历史 + 问题 → DeepSeek API 流式生成
+    → SSE 逐 token 下发(thinking 折叠 + content 展示)
+    → done 事件返回 sources 引用溯源 → 后台写库(仅存 content)
 ```
 
 ## API 接口
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| POST | `/chat/stream` | 流式聊天（SSE） |
-| GET | `/history` | 获取聊天历史 |
-| POST | `/upload` | 上传文档到知识库 |
-| GET | `/documents` | 列出知识库文档 |
-| DELETE | `/documents/{id}` | 删除知识库文档 |
+| POST | `/chat/stream` | 流式聊天（SSE：message/done/error） |
+| POST | `/chat` | 非流式聊天（兜底） |
+| GET | `/history` | 分页获取聊天历史 |
+| GET | `/history/delete` | 清空指定用户历史 |
+| POST | `/kb/upload` | 上传文档到知识库 |
+| POST | `/kb/ingest/{doc_id}` | 触发切块 + 向量化入库 |
+| GET | `/kb/documents` | 列出知识库文档 |
+| DELETE | `/kb/documents/{id}` | 删除知识库文档（级联删块） |
 
 ## License
 
