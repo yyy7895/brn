@@ -57,9 +57,8 @@ class Config:
     CHAT_MODEL: str = os.getenv("CHAT_MODEL", "deepseek-v4-flash")
 
     # ---- 数据库 ----
-    DB_URL: str = os.getenv(
-        "DB_URL", "postgresql://postgres:yyy007@127.0.0.1:5432/myname"
-    )
+    # 真实凭据仅允许从 .env / 环境变量读取，不保留任何实际密码于仓库中。
+    DB_URL: str = os.getenv("DB_URL", "postgresql://postgres:CHANGE_ME@127.0.0.1:5432/brn")
 
     # ---- RAG 检索参数 ----
     # TOP_K：每次检索取最相似的 K 个文档块拼进 prompt
